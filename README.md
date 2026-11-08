@@ -11,7 +11,7 @@ The wiki content itself lives in its own repository, [GnollHackWiki](https://git
 - **Sets the wiki options**: uses the `rugged` Git adapter, enables uploads, uses the first `<h1>` as the page title, resolves links case-insensitively, renders math with KaTeX, disables editing, and does not follow renames in the History view.
 - **Serializes Markdown rendering**: gollum-lib renders each page inside a block-form `Dir.chdir`, so two concurrent renders can fail with "conflicting chdir during another chdir block". A reentrant lock lets one render step run at a time.
 - **Supports crawlers**: answers `HEAD` requests as `GET` without a body, and serves `/robots.txt` and `/sitemap.xml`. The sitemap lists every page with the date of its last commit and is rebuilt after each new commit.
-- **Adds SEO template variables**: `{{page_title}}` and `{{description}}`, used by `.gollum/templates/layout.mustache` in the wiki repository. The description comes from a page's ingress, entry header, link list, or first paragraph, and is shortened to 160 characters.
+- **Adds SEO template variables**: `{{page_title}}` and `{{description}}`, used by `.gollum/templates/layout.mustache` in the wiki repository. The description comes from a page's ingress, caution note, entry header, link list, first usable paragraph or opening list. Legal notices, side notes and sentences that depend on surrounding text are skipped. Text is fitted to 160 characters at a sentence or fact boundary, and pages with nothing usable get the site-wide description.
 
 ## Usage
 
