@@ -1,0 +1,10 @@
+# Text is stored LF in the index and checked out CRLF in every working tree, so a Windows
+# clone matches what Windows editors write and Git sees no line-ending diffs. Ruby reads
+# config.rb with CRLF line endings as it does with LF.
+* text=auto eol=crlf
+
+# Files a Linux tool consumes stay LF, as in every repository here. None exist today.
+*.yml text eol=lf
+*.yaml text eol=lf
+*.py text eol=lf
+*.sh text eol=lf
