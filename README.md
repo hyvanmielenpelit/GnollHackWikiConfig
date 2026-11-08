@@ -29,3 +29,7 @@ The crawler and SEO settings assume the wiki is served at `https://wiki.gnollhac
 
 - [GnollHackWiki](https://github.com/hyvanmielenpelit/GnollHackWiki): the wiki content.
 - [GnollHack](https://github.com/hyvanmielenpelit/GnollHack): the game's source code.
+
+## License
+
+This repository is licensed under the [MIT License](LICENSE). The wiki content in the GnollHackWiki repository has its own license.
