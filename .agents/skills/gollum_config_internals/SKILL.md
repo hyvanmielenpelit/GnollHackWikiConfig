@@ -107,11 +107,25 @@ block". `config.rb` wraps `Gollum::Filter::Render#extract` in a reentrant lock
   the full history is.
 - One `Rugged::Repository` is opened per rebuild and closed in `ensure`.
 
-## 7. Asset Caching
+## 7. HTTP Caching
 
-`lib/gnollhack_assets.rb`, applied by the middleware `GnollHackAssetCaching`, which runs
-after `GnollHackCrawlerSupport` has turned HEAD into GET. For a GET answered 200 or 304
-under `/.gollum/`, except `/.gollum/templates/`:
+`lib/gnollhack_http_caching.rb` (`GnollHackHttpCaching.cache_control`), applied to every
+GET response by the middleware `GnollHackAssetCaching`, which runs after
+`GnollHackCrawlerSupport` has turned HEAD into GET. It sees `PATH_INFO` as the client sent
+it, before `GnollHackCleanUrls` rewrites a slug. First matching row wins; "served" is 200,
+206 or 304:
+
+| # | Request path | Status | `Cache-Control` | Replaces an existing one |
+|---|---|---|---|---|
+| 1 | Under `/.gollum/`, except `/.gollum/templates/` | served | `GnollHackAssets.cache_control`, below | yes |
+| 2 | Under `/gollum/assets/`, last segment matches `-[0-9a-f]{64}\.[A-Za-z0-9]+\z` (Sprockets) | served | `public, max-age=31536000, immutable` | yes |
+| 3 | Under `/gollum/assets/`, `.css` or `.js` | served | `no-cache` | yes |
+| 4 | Under `/gollum/assets/`, anything else (KaTeX fonts) | served | `public, max-age=604800` | yes |
+| 5 | Not under `/gollum/`, extension in `STATIC_EXTENSIONS`, `content-type` not `text/html` | served | `public, max-age=86400, s-maxage=604800` | yes |
+| 6 | A path of rows 1 to 5 (row 5 without the `content-type` test) | not served | `no-cache` | yes |
+| 7 | Anything else: pages, tool pages, `?raw`, 404s, an undecodable path | any | `no-cache` | no |
+
+Row 1, `lib/gnollhack_assets.rb`:
 
 | Request | `Cache-Control` |
 |---|---|
@@ -120,6 +134,21 @@ under `/.gollum/`, except `/.gollum/templates/`:
 | no `v`, `.css` or `.js` | `no-cache` |
 | no `v`, anything else | `public, max-age=604800` |
 
+- **Gollum sets no `Cache-Control` of its own** on pages, `send_file` files or
+  `Rack::Static` assets, and Front Door caches a response without one for one to three
+  days on a caching route. A response this middleware skipped would be frozen at the edge.
+- Row 7 keeps a value a response already has: the router's 301 (`public, max-age=86400`).
+  `/robots.txt` and `/sitemap.xml` are answered by `GnollHackCrawlerSupport` outside this
+  middleware, with `public, max-age=3600`.
+- Row 5's `content-type` test keeps a page out of it: `Foo.png.md` is served at `/Foo.png`
+  as `text/html`. `STATIC_EXTENSIONS` is compared lowercased on the decoded last segment,
+  and covers `/uploads/` and the root `/favicon.ico`.
+- Gollum's `/gollum/assets/*` route shortens `PATH_INFO` in place (`sub!`), so the
+  middleware copies the path before calling down.
+- Pages get `no-cache`, not `no-store`: Front Door treats both as uncacheable, and
+  `no-cache` keeps pages in the browser's back/forward cache.
+- Cached pages pass through the middleware on every hit; the store keeps the headers as
+  Gollum returned them.
 - `no-cache` still gets a cheap 304, because `send_file` answers `If-Modified-Since`.
 - The digest cache is per absolute path, guarded by a Mutex, and refreshed when the file's
   mtime or size changes.
@@ -180,8 +209,10 @@ rendered page cache".
   only page whose path, path without extension or slug matches with letter case ignored
   and spaces and underscores folded (`fold`: spaces to `_`, runs squeezed, lowercased).
   Sinatra ignores one trailing slash.
-- **Middleware order**: `GnollHackCrawlerSupport` (HEAD to GET, robots, sitemap) ->
-  `GnollHackAssetCaching` -> `GnollHackCleanUrls` -> Gollum. The rewrite replaces
+- **Middleware order**: `GnollHackFrontDoorOrigin` (ID check, host pinning; section 11) ->
+  `GnollHackCrawlerSupport` (HEAD to GET, robots, sitemap) -> `GnollHackAssetCaching` ->
+  `GnollHackCleanUrls` -> Gollum. Each `Precious::App.use` in `config.rb` adds the next
+  inner layer, so the order is the order of the sections. The rewrite replaces
   `PATH_INFO` with the escaped real path, which Gollum serves as before, `?raw` included.
 - **`escaped_url_path` is not overridden**: Gollum's tool pages build history, compare,
   edit and raw URLs from it, and its raw route needs the real file name. Tool pages
@@ -264,7 +295,55 @@ rendered page cache".
   is served stale: a template helper that reads another file, a setting read from disk,
   the time of day. Add a `check_cache.rb` check for it.
 
-## 10. Known Limits
+## 11. Azure Front Door
+
+The wiki is served through Azure Front Door (Standard/Premium); the profile, DNS and IIS
+are configured by hand, and the README's "Azure Front Door" section has the configuration.
+Documented Front Door behavior this repository relies on (`front-door-caching`,
+`front-door-rules-engine-actions`, `standard-premium/how-to-compression`,
+`front-door-http-headers-protocol`):
+
+- A caching route caches a response with no `Cache-Control` for a random one to three
+  days. `private`, `no-cache` and `no-store` are not cached, even when a rule set
+  overrides the route's caching. `s-maxage`, then `max-age`, then `Expires` set the edge
+  lifetime, up to 366 days.
+- Revalidation uses `Last-Modified` (`If-Modified-Since`); ETags are not supported.
+- Query string behavior is per route. With "Ignore query string" the theme stylesheet's
+  `?v=` would be ignored and its `immutable` response pinned under every new hash, so the
+  static route uses "Use query string".
+- Compression is only on a caching route, for 1 KB to 8 MB, and not for chunked origin
+  responses.
+- Front Door sends `X-Forwarded-Host` (the client's host), `X-Forwarded-Proto`,
+  `X-Forwarded-For`, `X-Azure-ClientIP` and `X-Azure-FDID` (the profile's ID). It connects
+  with the origin host name as `Host`.
+- A purge ignores query strings and letter case, and takes up to 10 minutes.
+
+How the repository uses it:
+
+- **Two routes**: `wiki-static` (caching on) for `/.gollum/*`, `/gollum/assets/*`,
+  `/uploads/*` and `/favicon.ico`, and `wiki-pages` (caching off) for `/*`. Pages stay
+  uncached even if a header is ever missing; static lifetimes come from section 7.
+- **ID check** (`GnollHackFrontDoorOrigin`, `lib/gnollhack_front_door.rb`): with
+  `GNOLLHACK_FRONT_DOOR_ID` set at startup, a request whose `X-Azure-FDID` is not one of
+  the IDs (comma-separated, compared lowercased) answers 403 `no-store`, before
+  robots and sitemap. Unset, it is off. The IDs are never logged; the startup line gives
+  their count.
+- **Host pinning**: a request with an `X-Azure-FDID` header gets `HTTP_HOST`,
+  `HTTP_X_FORWARDED_HOST` and `SERVER_NAME` set to `SITE_URL`'s host, `https` on port 443,
+  and `Forwarded` and `X-Forwarded-Port` removed. Gollum's `/gollum/feed/` builds its links
+  from `rack.url_scheme` and `HTTP_HOST`, and Sinatra's `absolute_redirects` (on in
+  Sinatra 4.1.1) builds `Location` from Rack's host, which honors `X-Forwarded-Host`, a
+  header a direct request can set to anything. Pinning is keyed on the header's presence,
+  not its value: pinning to the canonical site is harmless whoever asks, and it works
+  before the ID check is on. Local requests and the tools send no such header.
+- **WEBrick rewrites `Location`**: `WEBrick::HTTPResponse#setup_header` merges a path
+  `Location` (the router's 301) onto its own request URI, which it builds from `Host` and
+  `X-Forwarded-Host` outside the application, so pinning the env does not reach it. On a
+  Front Door request `GnollHackFrontDoorOrigin` therefore makes a path `Location` absolute
+  against `SITE_URL` itself (`GnollHackFrontDoor.public_location`).
+- The origin host name appears nowhere in the code.
+
+## 12. Known Limits
 
 - `word_cut` drops a complete last word.
 - The ingress search looks at nested block quotes too.

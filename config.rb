@@ -316,6 +316,58 @@
   Gollum::Filter::Render.prepend(GnollHackSerializedRender)
 
   ##############################################################################
+  # Azure Front Door origin
+  #
+  # The wiki is served to the public through Azure Front Door, which reaches
+  # this server at an origin host name of its own. That name appears nowhere
+  # in this file: the middleware recognizes Front Door by its headers. It is
+  # the outermost middleware: GnollHackFrontDoorOrigin -> GnollHackCrawlerSupport
+  # -> GnollHackAssetCaching -> GnollHackCleanUrls -> Gollum.
+  #
+  # - ID check: when GNOLLHACK_FRONT_DOOR_ID is set at startup (the profile's
+  #   Front Door ID, or several separated by commas), every request whose
+  #   X-Azure-FDID header is not one of them answers 403, robots.txt and
+  #   sitemap.xml included. Unset, every request is served.
+  # - Host pinning: a request with an X-Azure-FDID header is served as if it
+  #   were made to SITE_URL over HTTPS. Front Door sends the origin host name
+  #   as Host, and Gollum and Sinatra build some URLs from the request: the
+  #   feed from Host, redirects from X-Forwarded-Host, which a direct request
+  #   can set to anything. Pinning is keyed on the header's presence, so it
+  #   works before the ID check is on; local requests and the tools send no
+  #   such header and are served unchanged. A path Location on such a request
+  #   is made absolute here, because WEBrick would otherwise make it absolute
+  #   from the request's own headers.
+
+  require_relative 'lib/gnollhack_front_door'
+
+  class GnollHackFrontDoorOrigin
+    IDS = GnollHackFrontDoor.parse_ids(ENV['GNOLLHACK_FRONT_DOOR_ID'])
+    FORBIDDEN = "Forbidden\n"
+
+    warn "GnollHack Front Door: ID check on (#{IDS.length} ID(s))" unless IDS.empty?
+
+    def initialize(app)
+      @app = app
+    end
+
+    def call(env)
+      unless GnollHackFrontDoor.allowed?(env, IDS)
+        return [403, { 'content-type' => 'text/plain; charset=utf-8', 'cache-control' => 'no-store',
+                       'content-length' => FORBIDDEN.bytesize.to_s }, [FORBIDDEN]]
+      end
+      site = GnollHackCrawlerSupport::SITE_URL
+      status, headers, body = @app.call(GnollHackFrontDoor.pin_public_host(env, site))
+      if env.key?('HTTP_X_AZURE_FDID')
+        key = headers.keys.find { |k| k.to_s.casecmp?('location') }
+        headers[key] = GnollHackFrontDoor.public_location(headers[key], site) if key
+      end
+      [status, headers, body]
+    end
+  end
+
+  Precious::App.use GnollHackFrontDoorOrigin
+
+  ##############################################################################
   # Crawler support: HEAD requests, robots.txt, and sitemap.xml
   #
   # - HEAD: Gollum answers every method but GET with 403 when editing is off.
@@ -480,8 +532,18 @@
   # or size changes, so a pulled theme change applies within a second, also to
   # pages in the rendered page cache (section "Clean page URLs and the
   # rendered page cache").
+  #
+  # Gollum sets no Cache-Control of its own, and a CDN caches a response
+  # without one for days, so GnollHackAssetCaching gives every GET response
+  # one: Gollum's fingerprinted assets, uploads and other static files are
+  # cached, and pages get no-cache, so a CDN never caches them. A response that
+  # already has one, such as a 301, keeps it. The table is in
+  # lib/gnollhack_http_caching.rb. The middleware sees the path as the client
+  # sent it, before GnollHackCleanUrls rewrites a slug, and cached pages pass
+  # through it on every hit.
 
   require_relative 'lib/gnollhack_assets'
+  require_relative 'lib/gnollhack_http_caching'
 
   class GnollHackAssetCaching
     # Resolved once, before any render changes the working directory. Like
@@ -493,12 +555,17 @@
     end
 
     def call(env)
+      # Gollum's /gollum/assets/ routes shorten PATH_INFO in place.
+      path = env['PATH_INFO'].dup
       status, headers, body = @app.call(env)
-      if env['REQUEST_METHOD'] == 'GET' && [200, 304].include?(status.to_i)
-        policy = GnollHackAssets.cache_control(WIKI_ROOT, env['PATH_INFO'], env['QUERY_STRING'])
-        if policy
-          headers.keys.each { |key| headers.delete(key) if key.to_s.casecmp?('cache-control') }
-          headers['cache-control'] = policy
+      if env['REQUEST_METHOD'] == 'GET'
+        value, overwrite = GnollHackHttpCaching.cache_control(WIKI_ROOT, path, env['QUERY_STRING'], status, headers)
+        existing = headers.keys.select { |key| key.to_s.casecmp?('cache-control') }
+        if overwrite
+          existing.each { |key| headers.delete(key) }
+          headers['cache-control'] = value
+        elsif existing.empty?
+          headers['cache-control'] = value
         end
       end
       [status, headers, body]
