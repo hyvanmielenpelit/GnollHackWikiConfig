@@ -325,8 +325,9 @@
   #   Only Gollum's own tool pages (history, diffs, search, edit forms) and the
   #   repository's AI instruction folders are left out; Gollum's CSS and
   #   JavaScript stay readable so pages render for crawlers.
-  # - /sitemap.xml lists every page with the date of its last commit, Home
-  #   first under the same URL as its og:url. It is built from the served
+  # - /sitemap.xml lists every page with the date of its last commit, under
+  #   its canonical URL (section "Clean page URLs and the rendered page
+  #   cache"), with Home first as the site root. It is built from the served
   #   branch on first request and again after each new commit; a rebuild walks
   #   only the commits since the previous one.
 
@@ -340,8 +341,7 @@
     PRIVATE_FOLDERS = %w[.agents .claude].freeze
 
     # Pages left out of the sitemap: README.md is the repository's GitHub
-    # front page. The site root only redirects to Home.md, which is listed
-    # first.
+    # front page. Home.md is listed first, as the site root.
     SITEMAP_EXCLUDED = %w[README.md].freeze
     HOME_PAGE = 'Home.md'
 
@@ -402,7 +402,7 @@
           oid = repo.rev_parse(current.ref).oid
           if @sitemap_commit != oid
             @sitemap_dates = last_commit_dates(repo, oid)
-            @sitemap = build_sitemap(current, @sitemap_dates)
+            @sitemap = build_sitemap(current, @sitemap_dates, GnollHackPageIndexCache.at(repo, oid))
             @sitemap_commit = oid
           end
           @sitemap
@@ -412,12 +412,16 @@
       end
     end
 
-    def build_sitemap(current, dates)
+    # index is the GnollHackUrls::PageIndex of the commit being listed.
+    def build_sitemap(current, dates, index)
       pages = current.pages.reject do |page|
         page.path.split('/').any? { |part| part.start_with?('.') } || SITEMAP_EXCLUDED.include?(page.path)
       end
       home, others = pages.partition { |page| page.path == HOME_PAGE }
-      entries = (home + others).map { |page| ["#{SITE_URL}/#{page.escaped_url_path}", dates[page.path]] }
+      entries = (home + others).map do |page|
+        path = index&.canonical_path(page.path) || "/#{page.escaped_url_path}"
+        ["#{SITE_URL}#{path}", dates[page.path]]
+      end
 
       urls = entries.map do |loc, time|
         lastmod = time ? "<lastmod>#{time.getutc.strftime('%Y-%m-%dT%H:%M:%SZ')}</lastmod>" : ''
@@ -473,7 +477,9 @@
   # Last-Modified header. GnollHackAssetCaching gives them Cache-Control:
   # immutable for the current hash, revalidation for other CSS and JavaScript,
   # and one week for fonts and images. A file is hashed again when its mtime
-  # or size changes, so a pulled theme change applies on the next page view.
+  # or size changes, so a pulled theme change applies within a second, also to
+  # pages in the rendered page cache (section "Clean page URLs and the
+  # rendered page cache").
 
   require_relative 'lib/gnollhack_assets'
 
@@ -580,6 +586,255 @@
             html: @content, url_path: @page.url_path, title: title,
             metadata: (@page.respond_to?(:metadata) ? @page.metadata : {})
           )
+        end
+      end
+    end
+  end
+
+  ##############################################################################
+  # Clean page URLs and the rendered page cache
+  #
+  # Clean URLs: every page is served at a lowercase, hyphenated slug of its
+  # file path with no extension (lib/gnollhack_urls.rb), and Home at the site
+  # root. GnollHackCleanUrls rewrites a slug request to the page's real path
+  # before Gollum sees it, so titles, descriptions and everything else still
+  # come from the page itself. An old URL (the file path, with or without its
+  # extension, in any letter case, with or without a trailing slash) answers
+  # 301 to the slug. Wikilinks, og:url, <link rel="canonical"> and the sitemap
+  # use the slug. A page whose slug would collide with another page's, has an
+  # empty segment, starts with a reserved segment or equals a file's path
+  # keeps its file URL, and is logged when the index is built. Sub-pages,
+  # dot-folders, Gollum's tool pages, raw and version URLs, images and theme
+  # files are unchanged.
+  #
+  # Template helper added for layout.mustache:
+  #   {{canonical_url}} - the page's absolute canonical URL; nil on non-page
+  #                       views and for pages outside the index.
+  #
+  # The rendered page cache keeps the whole response of each page served at
+  # its canonical URL (GET, no query string, 200, text/html) in memory and
+  # answers the next request for it without entering Gollum. Every response
+  # carries x-gnollhack-cache: hit or miss. The cache belongs to one epoch,
+  # which grows whenever anything a page is rendered from changes:
+  #   - the served commit (stat of the branch's ref files once a second, a
+  #     Rugged verification when they changed and once a minute);
+  #   - the template folder (its file list and each file's stat);
+  #   - a /.gollum/ file whose versioned URL was rendered into a page
+  #     (GnollHackAssets.outdated_urls).
+  # A newer epoch empties the cache; a render that a change overtook is not
+  # stored. config.rb, lib/ and the gems are loaded at startup, and a restart
+  # empties the cache. Nothing is written to disk. Anything else a page's
+  # HTML comes to depend on must be added to the environment token, or it is
+  # served stale. GNOLLHACK_PAGE_CACHE=0 at startup turns the cache off.
+  #
+  # Paths are taken from the repository root: this wiki does not set
+  # page_file_dir.
+
+  require_relative 'lib/gnollhack_urls'
+  require_relative 'lib/gnollhack_page_cache'
+
+  module GnollHackPageIndexCache
+    # Seconds between two checks of the served commit and the environment.
+    CHECK_INTERVAL = 1
+    # Seconds after which the commit is read with Rugged even when the ref
+    # files look unchanged.
+    VERIFY_INTERVAL = 60
+
+    UNSET = Object.new.freeze
+
+    @lock = Mutex.new
+    @index = nil
+    @oid = nil
+    @epoch = 0
+    @ref = nil
+    @ref_files = nil
+    @stat_usable = false
+    @signature = nil
+    @checked = nil
+    @verified = nil
+    @environment = UNSET
+
+    class << self
+      # [index, epoch], read together. The index is nil until the repository
+      # has been read once.
+      def snapshot
+        @lock.synchronize do
+          now = monotonic
+          return [@index, @epoch] if @checked && now - @checked < CHECK_INTERVAL
+
+          note_environment
+          signature = @ref_files && GnollHackUrls.file_signature(@ref_files)
+          if @stat_usable && signature == @signature && @verified && now - @verified < VERIFY_INTERVAL
+            @checked = now
+          else
+            verify(signature)
+          end
+          [@index, @epoch]
+        end
+      end
+
+      def current
+        snapshot.first
+      end
+
+      # The index of a commit, read from an open repository.
+      def at(repo, oid)
+        @lock.synchronize { build(repo, oid) }
+      end
+
+      # The index for one Gollum::Wiki, which Gollum creates per request, so a
+      # render uses one index throughout.
+      def for_wiki(wiki)
+        return wiki.instance_variable_get(:@gnollhack_page_index) if wiki.instance_variable_defined?(:@gnollhack_page_index)
+        wiki.instance_variable_set(:@gnollhack_page_index, current)
+      end
+
+      # :stat when a due check stats the ref files, :verify when it opens the
+      # repository.
+      def gate
+        @stat_usable ? :stat : :verify
+      end
+
+      # For the tools: the next snapshot checks again.
+      def expire!
+        @lock.synchronize { @checked = nil }
+      end
+
+      # For the tools: the next snapshot reads the repository and rebuilds the
+      # index. The epoch is kept; the rebuild increments it.
+      def reset!
+        @lock.synchronize { @index = @oid = @signature = @checked = @verified = nil }
+      end
+
+      private
+
+      def monotonic
+        Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      end
+
+      # Called with @lock held. Increments the epoch when the templates or a
+      # rendered asset version changed since the previous check.
+      def note_environment
+        token = environment_token
+        @epoch += 1 unless @environment.equal?(UNSET) || token == @environment
+        @environment = token
+      end
+
+      def environment_token
+        dir = Precious::App.settings.wiki_options[:template_dir]
+        dir &&= File.expand_path(dir)
+        files = dir ? Dir.children(dir).sort.map { |name| File.join(dir, name) } : []
+        [files, GnollHackUrls.file_signature(files), GnollHackAssets.outdated_urls]
+      rescue SystemCallError
+        nil
+      end
+
+      # Called with @lock held. Reads the served commit with Rugged. The ref
+      # files' signature is taken before the ref is resolved, so a ref that
+      # moves meanwhile is verified again on the next check.
+      def verify(signature)
+        @ref ||= Gollum::Wiki.new(Precious::App.settings.gollum_path, Precious::App.settings.wiki_options).ref
+        repo = Rugged::Repository.new(GnollHackAssetCaching::WIKI_ROOT)
+        begin
+          unless @ref_files
+            @ref_files = [File.join(repo.path, 'refs', 'heads', @ref), File.join(repo.path, 'packed-refs')]
+            signature = GnollHackUrls.file_signature(@ref_files)
+          end
+          @stat_usable = repo.references.exist?("refs/heads/#{@ref}") && signature.any?
+          build(repo, repo.rev_parse(@ref).oid)
+        ensure
+          repo.close
+        end
+        @signature = signature
+        @verified = @checked = monotonic
+      rescue Rugged::Error, SystemCallError, Gollum::InvalidGitRepositoryError, Gollum::NoSuchPathError => e
+        warn "GnollHack page index: #{e.class}: #{e.message}"
+        @checked = monotonic
+      end
+
+      # Called with @lock held.
+      def build(repo, oid)
+        return @index if @index && @oid == oid
+        paths = []
+        repo.lookup(oid).tree.walk_blobs(:postorder) do |root, entry|
+          paths << (String.new(root, encoding: Encoding::BINARY) << entry[:name].b).force_encoding(Encoding::UTF_8)
+        end
+        pages, others = GnollHackUrls.partition_paths(paths, Gollum::Markup.extensions,
+                                                      Gollum::Page::SUBPAGENAMES.map { |name| name.to_s.capitalize })
+        index = GnollHackUrls::PageIndex.new(pages, others)
+        index.fallbacks.each { |page, reason| warn "GnollHack page index: #{page} keeps its file URL (#{reason})" }
+        @index = index
+        @oid = oid
+        @epoch += 1
+        index
+      end
+    end
+  end
+
+  GnollHackRenderedPages =
+    ENV['GNOLLHACK_PAGE_CACHE'] == '0' ? nil : GnollHackPageCache::Store.new(max_bytes: 128 * 1024 * 1024)
+
+  class GnollHackCleanUrls
+    def initialize(app)
+      @app = app
+    end
+
+    def call(env)
+      return @app.call(env) unless env['REQUEST_METHOD'] == 'GET'
+      return @app.call(env) if GnollHackUrls.passthrough?(env['PATH_INFO'])
+      # The epoch is read before Gollum reads anything for this request.
+      index, epoch = GnollHackPageIndexCache.snapshot
+      return @app.call(env) unless index
+
+      action, target = GnollHackUrls::Router.new(index).route(env['PATH_INFO'], env['QUERY_STRING'])
+      case action
+      when :rewrite
+        rewritten = env.merge('PATH_INFO' => target)
+        if GnollHackRenderedPages && env['QUERY_STRING'].to_s.empty?
+          GnollHackRenderedPages.fetch(epoch, target) { @app.call(rewritten) }
+        else
+          @app.call(rewritten)
+        end
+      when :redirect
+        link = CGI.escapeHTML(target)
+        body = %(<!DOCTYPE html>\n<title>Moved Permanently</title>\n<p>Moved to <a href="#{link}">#{link}</a>.</p>\n)
+        [301, { 'location' => target, 'content-type' => 'text/html; charset=utf-8',
+                'cache-control' => 'public, max-age=86400', 'content-length' => body.bytesize.to_s }, [body]]
+      else
+        @app.call(env)
+      end
+    end
+  end
+
+  Precious::App.use GnollHackCleanUrls
+
+  # Links to existing pages point to their slug. Gollum joins it to base_path
+  # and appends the anchor; Home's empty slug renders href="/".
+  module GnollHackSlugLinks
+    private
+
+    def generate_link(path, name = nil, extra = nil, kind = nil)
+      return super unless kind == :page_present
+      slug = GnollHackPageIndexCache.for_wiki(@markup.wiki)&.slug_for(Rack::Utils.unescape_path(path))
+      slug ? super(slug, name, extra, kind) : super
+    end
+  end
+
+  Gollum::Filter::Tags.prepend(GnollHackSlugLinks)
+
+  module Precious
+    module Views
+      class Layout
+        def canonical_url
+          nil
+        end
+      end
+
+      class Page
+        # A historical version gets the current page's URL.
+        def canonical_url
+          path = GnollHackPageIndexCache.for_wiki(@page.wiki)&.canonical_path(@page.path)
+          path && "#{GnollHackCrawlerSupport::SITE_URL}#{path}"
         end
       end
     end

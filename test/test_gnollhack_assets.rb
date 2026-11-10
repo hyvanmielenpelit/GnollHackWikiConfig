@@ -88,4 +88,65 @@ class TestGnollHackAssets < Minitest::Test
   def test_paths_outside_gollum_folder_are_left_alone
     assert_nil GnollHackAssets.cache_control(@root, '/Home', '')
   end
+
+  # outdated_urls. The count and the files versioned_url was asked about
+  # outlive a test, so each case settles the count first and asserts on the
+  # difference.
+
+  def settled_outdated_count
+    GnollHackAssets.outdated_urls
+  end
+
+  def rewrite(relative, content)
+    path = File.join(@root, relative)
+    File.binwrite(path, content)
+    later = File.mtime(path) + 5
+    File.utime(later, later, path)
+  end
+
+  def test_unchanged_file_is_not_outdated
+    GnollHackAssets.versioned_url(@root, CSS_URL)
+    base = settled_outdated_count
+    GnollHackAssets.versioned_url(@root, CSS_URL)
+    assert_equal base, GnollHackAssets.outdated_urls
+  end
+
+  def test_changed_file_is_outdated_once
+    GnollHackAssets.versioned_url(@root, CSS_URL)
+    base = settled_outdated_count
+    rewrite('.gollum/css/x.css', 'body{color:red;margin:0}')
+    assert_equal base + 1, GnollHackAssets.outdated_urls
+    assert_equal base + 1, GnollHackAssets.outdated_urls
+  end
+
+  def test_change_seen_first_by_a_render_is_counted
+    GnollHackAssets.versioned_url(@root, CSS_URL)
+    base = settled_outdated_count
+    rewrite('.gollum/css/x.css', 'body{color:blue;margin:1px}')
+    GnollHackAssets.versioned_url(@root, CSS_URL)
+    assert_equal base + 1, GnollHackAssets.outdated_urls
+  end
+
+  def test_deleted_file_is_outdated_once
+    GnollHackAssets.versioned_url(@root, CSS_URL)
+    base = settled_outdated_count
+    File.delete(File.join(@root, '.gollum/css/x.css'))
+    assert_equal base + 1, GnollHackAssets.outdated_urls
+    assert_equal base + 1, GnollHackAssets.outdated_urls
+  end
+
+  def test_file_only_cache_control_saw_is_not_tracked
+    version = Digest::SHA256.hexdigest('font-bytes')[0, 16]
+    GnollHackAssets.cache_control(@root, FONT_URL, "v=#{version}")
+    base = settled_outdated_count
+    rewrite('.gollum/fonts/f.woff2', 'other-font-bytes')
+    assert_equal base, GnollHackAssets.outdated_urls
+  end
+
+  def test_path_outside_gollum_folder_is_not_tracked
+    GnollHackAssets.versioned_url(@root, '/.gollum/../config.rb')
+    base = settled_outdated_count
+    rewrite('config.rb', '# another config')
+    assert_equal base, GnollHackAssets.outdated_urls
+  end
 end

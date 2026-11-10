@@ -63,7 +63,15 @@ ruby tools/dump_descriptions.rb C:\hmp\GnollHackWikiConfig\config.rb <scratch>\w
 
 Output: one row per page, `path <TAB> status <TAB> description <TAB> title`, and beside it
 `<scratch>\after_sitemap.xml`, the body of `GET /sitemap.xml`. Name pages after the TSV path
-to render only those.
+to render only those. Each page is requested at its canonical URL when the config has the
+clean URL index, and at its extensionless file path with an older config (a baseline).
+
+> [!NOTE]
+> **The scripts that go through `Precious::App` fill the rendered page cache** as they
+> render. Each page is requested once, so their results are not affected. A changed file in
+> `lib/` or a changed `config.rb` always needs a new process; the cache never outlives one.
+> When a result is in doubt, set `GNOLLHACK_PAGE_CACHE=0` before running to rule the cache
+> out.
 
 > [!IMPORTANT]
 > **`config.rb`'s wiki options are merged with the command-line options, not swapped for
@@ -179,8 +187,8 @@ Run it on `after.tsv` too (it has no source column, so only the text is compared
 before `checked` is a failure.
 
 **Rendered pages.** An override page shows no metadata `<table` before its first heading,
-and Home has the site-wide text both on `/Home` and on a version URL, `/Home/<sha>`.
-`MSYS_NO_PATHCONV=1` stops Git Bash from rewriting the `/Download` arguments into Windows
+and Home has the site-wide text both on `/` and on a version URL, `/Home.md/<sha>`.
+`MSYS_NO_PATHCONV=1` stops Git Bash from rewriting the `/download` arguments into Windows
 paths:
 
 ```bash
@@ -198,12 +206,12 @@ urls.each do |url|
   desc = CGI.unescapeHTML(body[/<meta name="description" content="([^"]*)"/, 1].to_s)
   lead = body[/<div class="markdown-body .*?(?=<h[1-6][\s>]|\z)/m].to_s
   puts [url, res.status, lead.include?("<table") ? "TABLE" : "no table", desc].join("\t")
-end' C:/hmp/GnollHackWikiConfig/config.rb "$CLONE" /Download /Home "/Home/$(git -C "$CLONE" rev-parse HEAD)"
+end' C:/hmp/GnollHackWikiConfig/config.rb "$CLONE" /download / "/Home.md/$(git -C "$CLONE" rev-parse HEAD)"
 ```
 
-Add every other override page to the URL list (URL-encoded, without `.md`). Every row must
-say `200` and `no table`; `/Download` shows its override, and both Home rows show the
-site-wide text.
+Add every other override page to the URL list by its canonical path (the second column of
+`ruby tools/check_urls.rb config.rb <wiki>`). Every row must say `200` and `no table`;
+`/download` shows its override, and both Home rows show the site-wide text.
 
 Read every page the fallback list names, and justify every duplicate group (near-identical
 source pages share a description legitimately). "These instructions" and "These guides"
@@ -241,21 +249,49 @@ Run the server in the background; startup takes a minute or two. Then, from Git 
 ```bash
 u=http://127.0.0.1:4611
 code() { curl -s -o /dev/null -w "%{http_code} $*\n" "$@"; }
-code "$u/"                                   # 302, Location ends in /Home
-code "$u/Home"; code "$u/Download"; code "$u/robots.txt"; code "$u/sitemap.xml"
+code "$u/"; code "$u/download"; code "$u/robots.txt"; code "$u/sitemap.xml"
+code "$u/Home"; code "$u/Home.md"; code "$u/Download"                    # 301
 code "$u/.gollum/css/gnollhack-theme.css"; code "$u/.gollum/fonts/cinzel-latin-wght-normal.woff2"
-code -I "$u/Home"                            # HEAD request
-curl -s "$u/Download" | grep -o '<meta name="description" content="[^"]*"'   # the override
-curl -s "$u/Home" | grep -oE 'gnollhack-theme\.css\?v=[0-9a-f]{16}'          # versioned stylesheet
-curl -s "$u/Home" | grep -c 'gollum.mermaid'                                 # 0
+code -I "$u/"                                # HEAD request
+curl -s "$u/download" | grep -o '<meta name="description" content="[^"]*"'   # the override
+curl -s "$u/" | grep -oE 'gnollhack-theme\.css\?v=[0-9a-f]{16}'              # versioned stylesheet
+curl -s "$u/" | grep -c 'gollum.mermaid'                                     # 0
 curl -s "$u/sitemap.xml" | grep -o '<loc>[^<]*</loc>' | head -n 3
-curl -s "$u/sitemap.xml" | grep -cE '<loc>https://wiki\.gnollhack\.com/</loc>|README\.md'   # 0
+curl -s "$u/sitemap.xml" | grep -cE '<loc>https://wiki\.gnollhack\.com/</loc>'   # 1
+curl -s "$u/sitemap.xml" | grep -cE 'README|\.md</loc>'                          # 0
 ```
 
-All codes are 200 except the 302 of `/`. The sitemap's first `<loc>` is
-`https://wiki.gnollhack.com/Home.md`, with no `/` entry and no `README.md`. A stylesheet URL
-with the current `?v=` answers `cache-control: public, max-age=31536000, immutable`
-(`curl -sI "$u/.gollum/css/gnollhack-theme.css?v=<hex>"`).
+All codes are 200 except the 301s of `/Home`, `/Home.md` and `/Download`. The sitemap's
+first `<loc>` is `https://wiki.gnollhack.com/`, with no `README` and no `.md` entry. A
+stylesheet URL with the current `?v=` answers
+`cache-control: public, max-age=31536000, immutable`
+(`curl -sI "$u/.gollum/css/gnollhack-theme.css?v=<hex>"`). A commit made in the clone while
+the server runs is picked up within a second, cached pages included.
+
+For a change to the clean URL routing (`lib/gnollhack_urls.rb`, the router, the index or
+the wikilink override), also run these, the timing with nothing else running:
+
+```powershell
+ruby tools/check_urls.rb config.rb <scratch>\wiki            # 0 fallbacks, exit 0
+ruby tools/check_urls.rb config.rb <scratch>\wiki --crawl    # 0 failures; several minutes
+ruby tools/check_urls.rb config.rb <scratch>\wiki --timing   # gate: stat, exit 0
+```
+
+For a change to the page cache, the epoch, the environment token or the asset helper, run
+the stale-content checks on a throwaway clone and a copy of the template folder, never on
+`<scratch>\wiki`: the script commits to the clone and edits the copy, and restores both.
+It refuses to run when the clone's origin is not a local folder, its working tree is not
+clean, or the template copy is inside it. Its origin being local does not make
+`<scratch>\wiki` safe to use.
+
+```powershell
+git -c core.longpaths=true clone -q <scratch>\wiki <scratch>\wct
+git -C <scratch>\wct config core.longpaths true
+Copy-Item -Recurse <scratch>\wiki\.gollum\templates <scratch>\tct
+ruby tools/check_cache.rb config.rb <scratch>\wct <scratch>\tct   # every line OK, exit 0
+```
+
+Keep the clone's path short: some upload paths exceed the Windows path limit otherwise.
 
 Then stop the server, and confirm with `Get-CimInstance Win32_Process -Filter "Name='ruby.exe'"`
 that no server of yours is left running.

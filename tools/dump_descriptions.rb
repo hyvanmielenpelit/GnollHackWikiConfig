@@ -20,9 +20,12 @@ Precious::App.set(:wiki_options, Precious::App.settings.wiki_options.merge(templ
 pages = only.empty? ? Dir.glob('**/*.md', base: wiki).reject { |p| p.start_with?('uploads/') }.sort : only
 req = Rack::MockRequest.new(Precious::App)
 File.binwrite(out.sub(/\.tsv\z/, '') + '_sitemap.xml', req.get('/sitemap.xml').body)
+# A config with clean page URLs serves each page at its canonical path; an
+# older config, and a page outside the index, at its extensionless file path.
+index = defined?(GnollHackPageIndexCache) ? GnollHackPageIndexCache.current : nil
 File.open(out, 'w:UTF-8') do |f|
   pages.each do |p|
-    url = '/' + p.sub(/\.md\z/, '').split('/').map { |s| ERB::Util.url_encode(s) }.join('/')
+    url = index&.canonical_path(p) || '/' + p.sub(/\.md\z/, '').split('/').map { |s| ERB::Util.url_encode(s) }.join('/')
     res = req.get(url)
     body = res.body.to_s.dup.force_encoding('UTF-8')
     desc = body[/<meta name="description" content="([^"]*)"/, 1]
