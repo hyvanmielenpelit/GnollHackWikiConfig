@@ -594,16 +594,19 @@
   ##############################################################################
   # Clean page URLs and the rendered page cache
   #
-  # Clean URLs: every page is served at a lowercase, hyphenated slug of its
-  # file path with no extension (lib/gnollhack_urls.rb), and Home at the site
-  # root. GnollHackCleanUrls rewrites a slug request to the page's real path
-  # before Gollum sees it, so titles, descriptions and everything else still
-  # come from the page itself. An old URL (the file path, with or without its
-  # extension, in any letter case, with or without a trailing slash) answers
-  # 301 to the slug. Wikilinks, og:url, <link rel="canonical"> and the sitemap
-  # use the slug. A page whose slug would collide with another page's, has an
-  # empty segment, starts with a reserved segment or equals a file's path
-  # keeps its file URL, and is logged when the index is built. Sub-pages,
+  # Clean URLs: every page is served at its title as Wikipedia writes it in a
+  # URL: its file path with no extension, spaces written as underscores, the
+  # capitalization of the file name kept, percent-encoded as MediaWiki encodes
+  # it (lib/gnollhack_urls.rb); Home is at the site root. GnollHackCleanUrls
+  # rewrites a slug request to the page's real path before Gollum sees it, so
+  # titles, descriptions and everything else still come from the page itself.
+  # An old URL (the file path, with or without its extension, with spaces
+  # written as %20, in any letter case, with or without a trailing slash)
+  # answers 301 to the slug. Wikilinks, og:url, <link rel="canonical"> and the
+  # sitemap use the slug. A page whose slug would collide with another page's,
+  # is an invalid title, starts with a reserved segment or equals a file's or
+  # another page's path keeps its file URL, and is logged when the index is
+  # built. Sub-pages,
   # dot-folders, Gollum's tool pages, raw and version URLs, images and theme
   # files are unchanged.
   #
@@ -808,15 +811,16 @@
 
   Precious::App.use GnollHackCleanUrls
 
-  # Links to existing pages point to their slug. Gollum joins it to base_path
-  # and appends the anchor; Home's empty slug renders href="/".
+  # Links to existing pages point to the page's URL, percent-encoded. Gollum
+  # joins it to base_path and appends the anchor; Home's empty URL renders
+  # href="/".
   module GnollHackSlugLinks
     private
 
     def generate_link(path, name = nil, extra = nil, kind = nil)
       return super unless kind == :page_present
-      slug = GnollHackPageIndexCache.for_wiki(@markup.wiki)&.slug_for(Rack::Utils.unescape_path(path))
-      slug ? super(slug, name, extra, kind) : super
+      url = GnollHackPageIndexCache.for_wiki(@markup.wiki)&.url_for(Rack::Utils.unescape_path(path))
+      url ? super(url, name, extra, kind) : super
     end
   end
 

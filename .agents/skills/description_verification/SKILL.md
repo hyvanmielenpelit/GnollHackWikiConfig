@@ -188,7 +188,7 @@ before `checked` is a failure.
 
 **Rendered pages.** An override page shows no metadata `<table` before its first heading,
 and Home has the site-wide text both on `/` and on a version URL, `/Home.md/<sha>`.
-`MSYS_NO_PATHCONV=1` stops Git Bash from rewriting the `/download` arguments into Windows
+`MSYS_NO_PATHCONV=1` stops Git Bash from rewriting the `/Download` arguments into Windows
 paths:
 
 ```bash
@@ -206,12 +206,12 @@ urls.each do |url|
   desc = CGI.unescapeHTML(body[/<meta name="description" content="([^"]*)"/, 1].to_s)
   lead = body[/<div class="markdown-body .*?(?=<h[1-6][\s>]|\z)/m].to_s
   puts [url, res.status, lead.include?("<table") ? "TABLE" : "no table", desc].join("\t")
-end' C:/hmp/GnollHackWikiConfig/config.rb "$CLONE" /download / "/Home.md/$(git -C "$CLONE" rev-parse HEAD)"
+end' C:/hmp/GnollHackWikiConfig/config.rb "$CLONE" /Download / "/Home.md/$(git -C "$CLONE" rev-parse HEAD)"
 ```
 
 Add every other override page to the URL list by its canonical path (the second column of
 `ruby tools/check_urls.rb config.rb <wiki>`). Every row must say `200` and `no table`;
-`/download` shows its override, and both Home rows show the site-wide text.
+`/Download` shows its override, and both Home rows show the site-wide text.
 
 Read every page the fallback list names, and justify every duplicate group (near-identical
 source pages share a description legitimately). "These instructions" and "These guides"
@@ -249,11 +249,11 @@ Run the server in the background; startup takes a minute or two. Then, from Git 
 ```bash
 u=http://127.0.0.1:4611
 code() { curl -s -o /dev/null -w "%{http_code} $*\n" "$@"; }
-code "$u/"; code "$u/download"; code "$u/robots.txt"; code "$u/sitemap.xml"
-code "$u/Home"; code "$u/Home.md"; code "$u/Download"                    # 301
+code "$u/"; code "$u/Download"; code "$u/robots.txt"; code "$u/sitemap.xml"
+code "$u/Home"; code "$u/Home.md"; code "$u/download"                    # 301
 code "$u/.gollum/css/gnollhack-theme.css"; code "$u/.gollum/fonts/cinzel-latin-wght-normal.woff2"
 code -I "$u/"                                # HEAD request
-curl -s "$u/download" | grep -o '<meta name="description" content="[^"]*"'   # the override
+curl -s "$u/Download" | grep -o '<meta name="description" content="[^"]*"'   # the override
 curl -s "$u/" | grep -oE 'gnollhack-theme\.css\?v=[0-9a-f]{16}'              # versioned stylesheet
 curl -s "$u/" | grep -c 'gollum.mermaid'                                     # 0
 curl -s "$u/sitemap.xml" | grep -o '<loc>[^<]*</loc>' | head -n 3
@@ -261,7 +261,7 @@ curl -s "$u/sitemap.xml" | grep -cE '<loc>https://wiki\.gnollhack\.com/</loc>'  
 curl -s "$u/sitemap.xml" | grep -cE 'README|\.md</loc>'                          # 0
 ```
 
-All codes are 200 except the 301s of `/Home`, `/Home.md` and `/Download`. The sitemap's
+All codes are 200 except the 301s of `/Home`, `/Home.md` and `/download`. The sitemap's
 first `<loc>` is `https://wiki.gnollhack.com/`, with no `README` and no `.md` entry. A
 stylesheet URL with the current `?v=` answers
 `cache-control: public, max-age=31536000, immutable`

@@ -6,12 +6,15 @@
 # [[Home]] wikilink does not render as href="/".
 #
 # --crawl requests every indexed page through Precious::App: the old URL,
-# with and without its extension, answers 301 to the canonical path; the
+# with and without its extension, and the canonical path in lowercase each
+# answer 301 to the canonical path, except a form that decodes to the
+# canonical path (the same URL in another encoding, which answers 200); the
 # canonical path answers 200 with <link rel="canonical"> and og:url equal to
 # its canonical URL; with the page cache on, a second request is a hit with
-# the same status, body and headers; no wikilink in the page routes to a
-# redirect. Then the sitemap's <loc> list is compared with the index. A full
-# crawl renders about 2,500 pages and takes several minutes.
+# the same status, body and headers; every wikilink in the page routes to a
+# rewrite, or names a fallback page's file path. Then the sitemap's <loc>
+# list is compared with the index. A full crawl renders about 2,500 pages
+# and takes several minutes.
 #
 # --timing renders no page and prints the cost of the routing layer and the
 # page cache in milliseconds, each the best of seven repeats. Exits 1 when a
@@ -90,7 +93,9 @@ when '--crawl'
     canonical = index.canonical_path(page)
     escaped = "/#{GnollHackUrls.escape_path(page)}"
     if index.slug_for(page)
-      [escaped, escaped.sub(/\.[^.\/]+\z/, '')].uniq.each do |old|
+      decoded = Rack::Utils.unescape_path(canonical)
+      olds = [escaped, escaped.sub(/\.[^.\/]+\z/, ''), canonical.downcase].uniq
+      olds.reject { |old| Rack::Utils.unescape_path(old) == decoded }.each do |old|
         res = req.get(old)
         checks.check('old URL answers 301 to the canonical path', res.status == 301 && res.headers['location'] == canonical,
                      "#{old} -> #{res.status} #{res.headers['location']}")
@@ -114,8 +119,10 @@ when '--crawl'
 
     body.scan(/<a class="internal present" href="([^"]*)"/).each do |(href)|
       path, query = CGI.unescapeHTML(href).sub(/#.*\z/, '').split('?', 2)
-      action, = router.route(path.empty? ? '/' : path, query)
-      checks.check('wikilinks never route to a redirect', action != :redirect, "#{page}: #{href}")
+      path = '/' if path.empty?
+      action, = router.route(path, query)
+      to_fallback = index.fallbacks.key?(Rack::Utils.unescape_path(path).delete_prefix('/'))
+      checks.check('wikilinks route to a page', action == :rewrite || to_fallback, "#{page}: #{href} -> #{action}")
     end
     puts "  #{i + 1} of #{pages.length}" if ((i + 1) % 250).zero?
   end

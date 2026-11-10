@@ -136,30 +136,49 @@ under `/.gollum/`, except `/.gollum/templates/`:
 `lib/gnollhack_urls.rb`, wired up in `config.rb`'s last section, "Clean page URLs and the
 rendered page cache".
 
-- **Slugs.** Per path segment: strip the extension (last segment), lowercase, transliterate
-  `ß æ œ ø ł đ ð þ`, NFKD and drop combining marks, delete apostrophes, turn every run
-  outside `[a-z0-9]` into one `-`, trim `-`. `Home.md` is `''` (the site root). A slug is
-  permanent once published: never change the derivation without redirects for the old form.
+- **Slugs.** A slug is a page's decoded URL title, in MediaWiki's form: strip the extension
+  with `%r{\.[^./]+\z}` (not `File.basename`/`File.extname`, which on Windows turn `A:B.md`
+  into `B.md`), and per segment turn every run of spaces and underscores into one `_` and
+  trim `_`. Letter case follows the file name, also the first letter (`iOS_and_macOS_Version`,
+  where MediaWiki would capitalize); every other character is kept. `Home.md` is `''` (the
+  site root). For a page without spaces the slug equals Gollum's own extensionless URL, so
+  those URLs were already in use. A slug is permanent once published: never change the
+  derivation without redirects for the old form.
+- **`url_path`** writes a slug in a URL the way MediaWiki's `wfUrlencode` does:
+  `ERB::Util.url_encode`, then `; @ $ ! * ( ) , /` back to literal, so `'` is `%27` and
+  non-ASCII is UTF-8 percent-encoded and the result is always ASCII. Two exceptions to
+  MediaWiki: `:` stays `%3A` and a final `.` is written `%2E`, because wikilink `href`s pass
+  through `Pathname#cleanpath`, which on Windows cuts at a colon and drops a final dot (see
+  Wikilinks). The router compares decoded paths, so every encoding of a slug (`'` or `%27`,
+  `!` or `%21`, a literal `:`) is served; only the canonical tag, `og:url`, the sitemap,
+  redirects and wikilinks name the one encoded form, as on Wikipedia.
 - **Indexed pages** are the committed files with a `Gollum::Markup.extensions` extension
   that are not sub-pages (`_Sidebar`, `_Footer`, `_Header`, matched by prefix as
   `Gollum::Page.valid_page_name?` does) and have no segment starting with `.`: the set
   `Gollum::Wiki#pages` returns, less dot-folders. `valid_page_name?` compiles a regular
   expression per call, so `partition_paths` builds one pattern per index build instead.
-- **Fallback pages** keep their escaped file URL and are never redirected: a whole
-  collision group, an empty segment, a reserved first segment (`gollum`, `uploads`), or a
-  slug equal to a non-page file's path ignoring case (`LICENSE`). `check_urls.rb` exits 1
-  on any.
+- **Fallback pages** keep their escaped file URL and are never redirected: an invalid
+  title (`:invalid_title`: an empty segment, a segment starting with `.`, a character
+  MediaWiki forbids, `# < > [ ] | { }` or a control character, or a `%` escape), a reserved
+  first segment ignoring case (`gollum`, `uploads`), a whole collision group (slugs equal
+  ignoring case, so no page can shadow another through a case redirect), or a slug equal
+  to the path of any file, a page or not, ignoring case (`LICENSE`; `Notes.txt` beside
+  `Notes.txt.md`). `check_urls.rb` exits 1 on any.
 - **Router rules**, after unescaping, squeezing `/` and stripping a trailing `/`:
   passthrough paths (`/gollum/`, `/uploads/`, dot-segments, robots, sitemap) pass; `/`
   rewrites to `Home.md`; `?raw` rewrites an exact slug and passes everything else; an
-  exact slug rewrites; a slug in other case or with a trailing slash redirects; a page's
-  path, with or without extension, in any case, redirects; everything else passes
-  (version URLs `/<file>.md/<sha>`, fallback pages, sub-pages, 404s). A redirect always
-  targets a slug or `/`, which rewrite, so there are no chains or loops. The 301 has a
-  path `Location` and `max-age=86400`.
+  exact slug (case-sensitive, any encoding) rewrites; a path the legacy lookup finds for a
+  page with a slug redirects to its canonical path: the file path with or without
+  extension, the space form, other letter case, doubled underscores, a trailing slash;
+  everything else passes (version URLs `/<file>.md/<sha>`, fallback pages, sub-pages,
+  404s, a double-encoded path such as `/Wizard%2527s_Tower`). A redirect always targets a
+  canonical path, which decodes to an exact slug and rewrites, so there are no chains or
+  loops. The 301 has a path `Location` and `max-age=86400`.
 - **Gollum's own lookup** (`Gollum::File.find` with `case_insensitive_tag_lookup`) matches
   the file name case-insensitively and folders case-sensitively; the legacy lookup here
-  ignores the case of both (exact match first, then a unique case-insensitive one).
+  tries the page path and the path without extension exactly (a full path wins), then the
+  only page whose path, path without extension or slug matches with letter case ignored
+  and spaces and underscores folded (`fold`: spaces to `_`, runs squeezed, lowercased).
   Sinatra ignores one trailing slash.
 - **Middleware order**: `GnollHackCrawlerSupport` (HEAD to GET, robots, sitemap) ->
   `GnollHackAssetCaching` -> `GnollHackCleanUrls` -> Gollum. The rewrite replaces
@@ -168,9 +187,18 @@ rendered page cache".
   edit and raw URLs from it, and its raw route needs the real file name. Tool pages
   therefore link to `.md` URLs, one 301 per click; they are disallowed in `robots.txt`.
 - **Wikilinks**: `generate_link` is overridden (prepended to `Gollum::Filter::Tags`, kept
-  private) for `kind == :page_present` only, calling `super` with the slug, so Gollum
-  still handles `base_path`, anchors and CSS classes; an empty slug renders `href="/"`.
-  The `name` argument is always set for present pages, so the link text is unchanged.
+  private) for `kind == :page_present` only, calling `super` with `url_for` (the encoded
+  URL, computed once per index build), so Gollum still handles `base_path`, anchors and CSS
+  classes; Home's empty URL renders `href="/"`. The `name` argument is always set for
+  present pages, so the link text is unchanged. `Tags#generate_link` passes the joined path
+  through `Gollum::Helpers#trim_leading_slashes` (`gsub('%2F', '/')`, then
+  `Pathname.new(url).cleanpath`); `Tags#process` also replaces `%2f`. On Windows,
+  `cleanpath` follows file name rules for the last segment: `/Foo:_Bar/Baz` becomes
+  `/Foo/Baz` and `/a/Vol.` becomes `/a/Vol`, while `%3A`, `%2E`, a dot inside a name and
+  `( ) , ! ; @ $ * ~` come through unchanged; so do `%27` and a literal `'` (nothing encodes
+  it for us). A literal non-ASCII character would be percent-encoded by libxml2. IIS in
+  production answers `%2B` itself with 404 (request filtering rejects double escaping), so
+  a page with `+` in its file name is unreachable at any URL.
 - **The commit check** (`GnollHackPageIndexCache.snapshot`), three paths: checked less than
   a second ago, return the cached index; otherwise stat the branch's loose ref file and
   `packed-refs` and, when that signature is unchanged and the last Rugged verification is
@@ -184,7 +212,7 @@ rendered page cache".
 - **Measured costs** (development machine, figures vary by a factor of 3 to 5): middleware
   on an asset path 0.001 ms, on a slug 0.05 ms, a wikilink 0.0005 ms, a due check about
   1 ms (two ref stats, the template folder and the rendered stylesheets), a Rugged
-  verification 6 to 22 ms, an index rebuild 25 to 50 ms, a 301 0.55 ms. Gollum renders a
+  verification 6 to 22 ms, an index rebuild 25 to 75 ms, a 301 0.55 ms. Gollum renders a
   small page in 125 to 140 ms and the largest in about 3 s. `check_urls.rb --timing`
   guards the per-request figures.
 - **View load order**: the section reopens `Precious::Views::Page`, which is only safe

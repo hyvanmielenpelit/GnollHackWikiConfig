@@ -1,6 +1,12 @@
-# Clean page URLs for a Gollum wiki: each page's lowercase, hyphenated slug,
-# derived from its file path, the index from slugs to page files, and the
-# routing of a request path to a rewrite, a redirect or Gollum itself.
+# Clean page URLs for a Gollum wiki: each page's title in the form Wikipedia
+# (MediaWiki) writes it in a URL, derived from its file path, the index from
+# titles to page files, and the routing of a request path to a rewrite, a
+# redirect or Gollum itself.
+#
+# A slug is a page's decoded URL title: its file path without the extension,
+# spaces written as underscores, the capitalization and every other character
+# of the file name kept. url_path percent-encodes it for a URL; the router
+# compares decoded paths, so every encoding of a slug reaches its page.
 
 require 'erb'
 require 'set'
@@ -9,43 +15,55 @@ require 'rack/utils'
 module GnollHackUrls
   HOME_PAGE = 'Home.md'
 
-  # First path segments that are Gollum's own routes.
+  # First path segments that are Gollum's own routes, compared ignoring case.
   RESERVED = %w[gollum uploads].freeze
 
-  # Letters that Unicode NFKD does not decompose into an ASCII base letter.
-  TRANSLITERATIONS = {
-    'ß' => 'ss', 'æ' => 'ae', 'œ' => 'oe', 'ø' => 'o',
-    'ł' => 'l', 'đ' => 'd', 'ð' => 'd', 'þ' => 'th'
+  # A page file's extension. Not File.extname, which on Windows reads 'A:B.md'
+  # as a drive-relative path.
+  EXTENSION = %r{\.[^./]+\z}
+  SEPARATORS = /[ _]+/
+  # What MediaWiki forbids in a title, and a percent-escape, which would
+  # decode ambiguously.
+  INVALID_TITLE = /[#<>\[\]|{}\p{Cc}]|%\h\h/
+
+  # The characters MediaWiki's wfUrlencode leaves unencoded beyond those
+  # ERB::Util.url_encode leaves. ':' is not among them: Gollum passes every
+  # wikilink through Pathname#cleanpath, which on Windows cuts a path at a
+  # colon and drops a final dot, so ':' stays %3A and a final '.' is %2E.
+  URL_KEPT = {
+    '%3B' => ';', '%40' => '@', '%24' => '$', '%21' => '!', '%2A' => '*',
+    '%28' => '(', '%29' => ')', '%2C' => ',', '%2F' => '/'
   }.freeze
-  TRANSLITERATION_PATTERN = Regexp.union(TRANSLITERATIONS.keys)
-  APOSTROPHES = /['‘’ʼ]/
-  COMBINING_MARKS = /\p{Mn}/
-  NON_SLUG = /[^a-z0-9]+/
-  EDGE_HYPHENS = /\A-+|-+\z/
+  URL_KEPT_PATTERN = Regexp.union(URL_KEPT.keys)
 
   PASSTHROUGH_PATHS = %w[/robots.txt /sitemap.xml].freeze
 
   module_function
 
-  # The slug of one path segment: lowercase ASCII letters, digits and single
-  # hyphens. Empty when nothing usable is left.
-  def slug_segment(segment)
-    s = segment.downcase
-    unless s.ascii_only?
-      s = s.gsub(TRANSLITERATION_PATTERN, TRANSLITERATIONS).unicode_normalize(:nfkd).gsub(COMBINING_MARKS, '')
-    end
-    s.gsub(APOSTROPHES, '').gsub(NON_SLUG, '-').gsub(EDGE_HYPHENS, '')
-  end
-
-  # The slug of a page path, without its extension: '' for Home, nil when a
-  # segment has no usable characters.
+  # The slug of a page path: '' for Home, nil when the path is not a valid
+  # title (no segment, an empty segment, a segment that starts with '.', or a
+  # character MediaWiki forbids).
   def slug(page_path)
     return '' if page_path == HOME_PAGE
-    segments = page_path.split('/')
-    return nil if segments.empty?
-    segments[-1] = File.basename(segments[-1], File.extname(segments[-1]))
-    slugs = segments.map { |s| slug_segment(s) }
-    slugs.any?(&:empty?) ? nil : slugs.join('/')
+    segments = page_path.sub(EXTENSION, '').split('/', -1).map do |segment|
+      segment.gsub(SEPARATORS, '_').delete_prefix('_').delete_suffix('_')
+    end
+    return nil if segments.empty? || segments.any? { |s| s.empty? || s.start_with?('.') }
+    title = segments.join('/')
+    title.match?(INVALID_TITLE) ? nil : title
+  end
+
+  # A slug as it appears in a URL, always ASCII. Rack::Utils.unescape_path
+  # turns it back into the slug.
+  def url_path(slug)
+    url = ERB::Util.url_encode(slug).gsub(URL_KEPT_PATTERN, URL_KEPT)
+    url.end_with?('.') ? "#{url.delete_suffix('.')}%2E" : url
+  end
+
+  # The form request paths and file paths are compared in when letter case,
+  # spaces and underscores are ignored.
+  def fold(path)
+    path.tr(' ', '_').squeeze('_').downcase
   end
 
   # A path escaped the way Gollum's escaped_url_path escapes it.
@@ -94,10 +112,12 @@ module GnollHackUrls
     end
   end
 
-  # The pages of one commit and their slugs. A page whose slug collides with
-  # another's, has an empty segment, starts with a reserved segment, or equals
-  # a non-page file's path ignoring case is a fallback page: it keeps its
-  # escaped file path as its URL.
+  # The pages of one commit and their slugs. A page whose path is not a valid
+  # title (:invalid_title), whose slug starts with a reserved segment
+  # (:reserved), equals another page's slug ignoring case (:collision, the
+  # whole group), or equals the path of any file, a page or not, ignoring case
+  # (:file_conflict) is a fallback page: it keeps its escaped file path as its
+  # URL.
   class PageIndex
     attr_reader :pages, :fallbacks, :collisions
 
@@ -107,69 +127,89 @@ module GnollHackUrls
       @collisions = {}
       @slug_to_page = {}
       @page_to_slug = {}
+      @page_to_url = {}
 
-      by_slug = Hash.new { |h, k| h[k] = [] }
+      slugs = {}
+      by_folded_slug = Hash.new { |h, k| h[k] = [] }
       @pages.each do |page|
         slug = GnollHackUrls.slug(page)
         if slug.nil?
-          @fallbacks[page] = :empty_segment
-        elsif RESERVED.include?(slug.split('/').first)
+          @fallbacks[page] = :invalid_title
+        elsif RESERVED.include?(slug.split('/').first.to_s.downcase)
           @fallbacks[page] = :reserved
         else
-          by_slug[slug] << page
+          slugs[page] = slug
+          by_folded_slug[slug.downcase] << page
         end
       end
 
-      files = other_paths.map(&:downcase).to_set
-      by_slug.each do |slug, group|
+      files = (other_paths + @pages).map(&:downcase).to_set
+      by_folded_slug.each do |folded, group|
         if group.length > 1
-          @collisions[slug] = group.freeze
+          @collisions[folded] = group.freeze
           group.each { |page| @fallbacks[page] = :collision }
-        elsif files.include?(slug)
+        elsif files.include?(folded)
           @fallbacks[group.first] = :file_conflict
         else
-          @slug_to_page[slug] = group.first
-          @page_to_slug[group.first] = slug
+          page = group.first
+          slug = slugs[page].freeze
+          @slug_to_page[slug] = page
+          @page_to_slug[page] = slug
+          @page_to_url[page] = GnollHackUrls.url_path(slug).freeze
         end
       end
 
       @known = @pages.to_set
+      # A page's full path wins over another page's path without extension.
       @legacy_exact = {}
+      @pages.each { |page| @legacy_exact[page] = page }
+      @pages.each { |page| @legacy_exact[page.sub(EXTENSION, '')] ||= page }
       legacy_folded = Hash.new { |h, k| h[k] = [] }
       @pages.each do |page|
-        [page, page.sub(%r{\.[^./]+\z}, '')].uniq.each do |key|
-          @legacy_exact[key] ||= page
-          legacy_folded[key.downcase] << page
-        end
+        keys = [GnollHackUrls.fold(page), GnollHackUrls.fold(page.sub(EXTENSION, ''))]
+        keys << @page_to_slug[page].downcase if @page_to_slug[page]
+        keys.uniq.each { |key| legacy_folded[key] << page }
       end
       @legacy_folded = legacy_folded.transform_values { |group| group.uniq.freeze }
 
-      [@fallbacks, @collisions, @slug_to_page, @page_to_slug, @known, @legacy_exact, @legacy_folded].each(&:freeze)
+      [@fallbacks, @collisions, @slug_to_page, @page_to_slug, @page_to_url, @known, @legacy_exact,
+       @legacy_folded].each(&:freeze)
       freeze
     end
 
-    # The slug ('' for Home), or nil for a fallback page or an unknown path.
+    # The decoded slug ('' for Home), or nil for a fallback page or an unknown
+    # path.
     def slug_for(page_path)
       @page_to_slug[page_path]
     end
 
-    # '/' + slug; a fallback page's escaped file path; nil for an unknown path.
+    # The slug as it appears in a URL ('' for Home), or nil for a fallback page
+    # or an unknown path.
+    def url_for(page_path)
+      @page_to_url[page_path]
+    end
+
+    # '/' + url_for; a fallback page's escaped file path; nil for an unknown
+    # path.
     def canonical_path(page_path)
-      slug = @page_to_slug[page_path]
-      return "/#{slug}" if slug
+      url = @page_to_url[page_path]
+      return "/#{url}" if url
       @known.include?(page_path) ? "/#{GnollHackUrls.escape_path(page_path)}" : nil
     end
 
+    # The page whose slug is exactly the decoded slug given.
     def page_for_slug(slug)
       @slug_to_page[slug]
     end
 
-    # The page whose path equals path, with or without its extension: an
-    # exact match, else the only case-insensitive match, else nil.
+    # The page that a decoded request path names in an old or variant form:
+    # its path with or without its extension exactly, else the only page
+    # whose path, path without extension or slug equals it when letter case,
+    # spaces and underscores are ignored, else nil.
     def page_for_legacy(path)
       exact = @legacy_exact[path]
       return exact if exact
-      found = @legacy_folded[path.downcase]
+      found = @legacy_folded[GnollHackUrls.fold(path)]
       found && found.length == 1 ? found.first : nil
     end
 
@@ -200,11 +240,10 @@ module GnollHackUrls
       page = trailing ? nil : @index.page_for_slug(path)
       return page ? rewrite(page) : [:pass] if raw?(query_string)
       return rewrite(page) if page
-      return redirect("/#{path.downcase}", query_string) if @index.page_for_slug(path.downcase)
 
+      # A canonical path decodes to an exact slug, so a redirect never chains.
       legacy = @index.page_for_legacy(path)
-      slug = legacy && @index.slug_for(legacy)
-      return redirect("/#{slug}", query_string) if slug
+      return redirect(@index.canonical_path(legacy), query_string) if legacy && @index.slug_for(legacy)
       [:pass]
     end
 

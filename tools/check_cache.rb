@@ -188,24 +188,24 @@ begin
   puts '--- 4. a commit that adds a page, then one that adds its link target'
   write.call('Cache Check Source.md', "See [[Cache Check Target]].\n")
   commit.call('Add a source page')
-  _, _, b = get.call('/cache-check-source')
+  _, _, b = get.call('/Cache_Check_Source')
   check.call('the link to the missing page is absent', b.include?('class="internal absent"'))
-  get.call('/cache-check-source')
+  get.call('/Cache_Check_Source')
   write.call('Cache Check Target.md', "Target.\n")
   commit.call('Add the target page')
-  _, s, b = get.call('/cache-check-source')
+  _, s, b = get.call('/Cache_Check_Source')
   check.call('the source is a miss whose link is present, with the slug',
-             s == 'miss' && b.include?('<a class="internal present" href="/cache-check-target">'), s.inspect)
+             s == 'miss' && b.include?('<a class="internal present" href="/Cache_Check_Target">'), s.inspect)
 
   puts '--- 5. a commit that deletes a cached page'
-  get.call('/cache-check-target')
-  get.call('/cache-check-target')
+  get.call('/Cache_Check_Target')
+  get.call('/Cache_Check_Target')
   git.call('rm', '-q', 'Cache Check Target.md')
   git.call('commit', '-q', '-m', 'Delete the target page')
   settle.call
-  r, s, = get.call('/cache-check-target')
+  r, s, = get.call('/Cache_Check_Target')
   check.call('its slug answers 404, not cached', r.status == 404 && s.nil?, "#{r.status} #{s.inspect}")
-  _, _, b = get.call('/cache-check-source')
+  _, _, b = get.call('/Cache_Check_Source')
   check.call('the link to it is absent again', b.include?('class="internal absent"'))
 
   puts '--- 6. pack-refs and gc'
@@ -290,7 +290,7 @@ begin
   settle.call
   _, s, b = get.call(first)
   check.call('the first page is a miss equal to the body from check 1', s == 'miss' && b == b1, s.inspect)
-  r_source, = get.call('/cache-check-source')
+  r_source, = get.call('/Cache_Check_Source')
   check.call('pages added since answer 404', r_source.status == 404, r_source.status)
 
   puts "page cache: #{store.stats.inspect}; gate: #{index_cache.gate}"
