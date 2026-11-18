@@ -322,7 +322,8 @@
   # this server at an origin host name of its own. That name appears nowhere
   # in this file: the middleware recognizes Front Door by its headers. It is
   # the outermost middleware: GnollHackFrontDoorOrigin -> GnollHackCrawlerSupport
-  # -> GnollHackAssetCaching -> GnollHackCleanUrls -> Gollum.
+  # -> GnollHackAssetCaching -> GnollHackCleanUrls -> GnollHackSearchRoutes ->
+  # Gollum.
   #
   # - ID check: when GNOLLHACK_FRONT_DOOR_ID is set at startup (the profile's
   #   Front Door ID, or several separated by commas), every request whose
@@ -368,7 +369,7 @@
   Precious::App.use GnollHackFrontDoorOrigin
 
   ##############################################################################
-  # Crawler support: HEAD requests, robots.txt, and sitemap.xml
+  # Crawler support: HEAD requests, robots.txt, sitemap.xml, and opensearch.xml
   #
   # - HEAD: Gollum answers every method but GET with 403 when editing is off.
   #   A HEAD request is passed on as a GET and its body dropped, so link
@@ -381,7 +382,10 @@
   #   its canonical URL (section "Clean page URLs and the rendered page
   #   cache"), with Home first as the site root. It is built from the served
   #   branch on first request and again after each new commit; a rebuild walks
-  #   only the commits since the previous one.
+  #   only the commits since the previous one. README.md and the other files
+  #   GitHub gives a meaning to (GnollHackUrls.github_file?) are left out.
+  # - /opensearch.xml describes the wiki's search (section "Search") to
+  #   browsers, with its suggestion URL.
 
   require 'cgi'
   require 'rugged'
@@ -392,9 +396,7 @@
     # Repository folders whose files Gollum serves but which are not wiki pages.
     PRIVATE_FOLDERS = %w[.agents .claude].freeze
 
-    # Pages left out of the sitemap: README.md is the repository's GitHub
-    # front page. Home.md is listed first, as the site root.
-    SITEMAP_EXCLUDED = %w[README.md].freeze
+    # Home.md is listed first in the sitemap, as the site root.
     HOME_PAGE = 'Home.md'
 
     ROBOTS_TXT = <<~TEXT
@@ -406,6 +408,20 @@
 
       Sitemap: #{SITE_URL}/sitemap.xml
     TEXT
+
+    OPENSEARCH_XML = <<~XML
+      <?xml version="1.0" encoding="UTF-8"?>
+      <OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">
+        <ShortName>GnollHack Wiki</ShortName>
+        <Description>Search the official GnollHack wiki</Description>
+        <InputEncoding>UTF-8</InputEncoding>
+        <Image width="16" height="16" type="image/png">#{SITE_URL}/.gollum/favicon/favicon-16x16.png</Image>
+        <Image width="32" height="32" type="image/png">#{SITE_URL}/.gollum/favicon/favicon-32x32.png</Image>
+        <Url type="text/html" method="get" template="#{SITE_URL}/gollum/search?q={searchTerms}"/>
+        <Url type="application/x-suggestions+json" method="get" template="#{SITE_URL}/gollum/search/suggest?q={searchTerms}"/>
+        <Url type="application/opensearchdescription+xml" rel="self" template="#{SITE_URL}/opensearch.xml"/>
+      </OpenSearchDescription>
+    XML
 
     def initialize(app)
       @app = app
@@ -424,6 +440,8 @@
           text_response(ROBOTS_TXT, 'text/plain; charset=utf-8')
         elsif env['REQUEST_METHOD'] == 'GET' && env['PATH_INFO'] == '/sitemap.xml'
           text_response(sitemap, 'application/xml; charset=utf-8')
+        elsif env['REQUEST_METHOD'] == 'GET' && env['PATH_INFO'] == '/opensearch.xml'
+          text_response(OPENSEARCH_XML, 'application/opensearchdescription+xml; charset=utf-8')
         else
           @app.call(env)
         end
@@ -467,7 +485,7 @@
     # index is the GnollHackUrls::PageIndex of the commit being listed.
     def build_sitemap(current, dates, index)
       pages = current.pages.reject do |page|
-        page.path.split('/').any? { |part| part.start_with?('.') } || SITEMAP_EXCLUDED.include?(page.path)
+        page.path.split('/').any? { |part| part.start_with?('.') } || GnollHackUrls.github_file?(page.path)
       end
       home, others = pages.partition { |page| page.path == HOME_PAGE }
       entries = (home + others).map do |page|
@@ -747,6 +765,12 @@
         snapshot.first
       end
 
+      # [index, epoch, oid of the commit the index was built from], read
+      # together, without a commit check.
+      def state
+        @lock.synchronize { [@index, @epoch, @oid] }
+      end
+
       # The index of a commit, read from an open repository.
       def at(repo, oid)
         @lock.synchronize { build(repo, oid) }
@@ -910,3 +934,389 @@
       end
     end
   end
+
+  ##############################################################################
+  # Search
+  #
+  # /gollum/search answers from an in-memory index of the served commit's
+  # pages (lib/gnollhack_search.rb), not Gollum's walk over every file of the
+  # tree. Only indexed pages are searched (section "Clean page URLs and the
+  # rendered page cache"), less README.md and the other files GitHub gives a
+  # meaning to (GnollHackUrls.github_file?): no uploads, images, theme files,
+  # dot-folders or sub-pages. The index is built from each page's Markdown
+  # source, converted to plain text, on the first search after startup; a
+  # search after a new commit gets the previous index while a low-priority
+  # thread builds the next one.
+  #
+  # - Results: every word must match, "quoted phrases" and -excluded words;
+  #   ranked by title, headings, folder and BM25 over the text, 20 per page,
+  #   in order; each links to the page's canonical URL with a #:~:text=
+  #   fragment.
+  # - Go: a query equal to exactly one page's title (letter case, spaces and
+  #   underscores ignored) answers 302 to that page; fulltext=1 shows the
+  #   results instead.
+  # - /gollum/search/suggest?q= answers up to 8 page titles in the OpenSearch
+  #   suggestions format.
+  # - At most SLOTS searches compute at once; a request that waits longer
+  #   than WAIT seconds for a slot answers 503. Every other path passes
+  #   GnollHackSearchRoutes after one prefix check.
+  #
+  # Template variables added for search.mustache and searchbar.mustache:
+  #   {{query_value}}, {{has_query}}, {{results}} (each with name, href, url,
+  #   title_html, snippet_html, folder, count, filename_count, context),
+  #   {{has_results}}, {{no_results}}, {{total}}, {{result_summary}},
+  #   {{paged}}, {{first_result}}, {{last_result}}, {{previous_page_path}},
+  #   {{next_page_path}}, {{fulltext_path}}, {{did_you_mean}} (title, url),
+  #   {{has_did_you_mean}}. title_html and snippet_html are HTML built from
+  #   escaped text. The view is noindex and sets no searchTerms for Gollum's
+  #   client-side highlighting.
+  #
+  # Search responses are never page-cached: /gollum/ paths pass through the
+  # router. Nothing a cached page's HTML depends on is read here.
+
+  require 'json'
+  require 'rack/request'
+  require_relative 'lib/gnollhack_search'
+  require 'gollum/views/search'
+
+  module GnollHackSearchIndexCache
+    # Documents read between two yields to other threads during a build.
+    YIELD_EVERY = 1
+
+    @lock = Mutex.new
+    @index = nil
+    @oid = nil
+    @builder = nil
+
+    class << self
+      # The search index of the served commit, or of the previous commit while
+      # the next one builds; nil when none could be built.
+      def current
+        GnollHackPageIndexCache.snapshot
+        page_index, _, oid = GnollHackPageIndexCache.state
+        return @index unless page_index && oid
+        @lock.synchronize do
+          return @index if @index && @oid == oid
+          if @index.nil?
+            built = build_logged(page_index, oid)
+            @index, @oid = built, oid if built
+          elsif !@builder&.alive?
+            @builder = Thread.new { rebuild(page_index, oid) }
+            @builder.priority = -1
+          end
+          @index
+        end
+      end
+
+      # The thread building the next index, or nil.
+      def builder
+        @builder
+      end
+
+      # For the tools: the index of a commit, built in the calling thread.
+      def build(page_index, oid)
+        paths = page_index.pages.reject { |path| GnollHackUrls.github_file?(path) }
+        wanted = paths.to_set
+        blobs = {}
+        documents = []
+        repo = Rugged::Repository.new(GnollHackAssetCaching::WIKI_ROOT)
+        begin
+          repo.lookup(oid).tree.walk_blobs(:postorder) do |root, entry|
+            path = (String.new(root, encoding: Encoding::BINARY) << entry[:name].b).force_encoding(Encoding::UTF_8)
+            blobs[path] = entry[:oid] if wanted.include?(path)
+          end
+          paths.each_with_index do |path, i|
+            Thread.pass if (i % YIELD_EVERY).zero?
+            next unless blobs[path]
+            documents << GnollHackSearch.document(path, page_index.canonical_path(path), repo.lookup(blobs[path]).content)
+          end
+        ensure
+          repo.close
+        end
+        GnollHackSearch::Index.new(documents)
+      end
+
+      # For the tools: the next search builds an index again, in its own
+      # thread.
+      def reset!
+        @lock.synchronize { @index = @oid = nil }
+      end
+
+      private
+
+      def rebuild(page_index, oid)
+        built = build_logged(page_index, oid)
+        @lock.synchronize { @index, @oid = built, oid } if built
+      end
+
+      def build_logged(page_index, oid)
+        build(page_index, oid)
+      rescue StandardError => e
+        warn "GnollHack search: #{e.class}: #{e.message}"
+        nil
+      end
+    end
+  end
+
+  # One request's results: the index and the parsed query, searched once per
+  # page of results asked for.
+  class GnollHackSearchResults
+    def initialize(index, query)
+      @index = index
+      @query = query
+      @pages = {}
+    end
+
+    def slice(offset, limit)
+      page(offset, limit)[:results].map { |result| GnollHackSearchResults.view_hash(result) }
+    end
+
+    def length
+      (@pages.values.first || page(0, GnollHackSearchView::PER_PAGE))[:total]
+    end
+
+    def empty?
+      length.zero?
+    end
+
+    def did_you_mean
+      @index ? @index.did_you_mean(@query.raw) : []
+    end
+
+    # Gollum's result keys, so its own search.mustache still renders, and
+    # those of the wiki's template.
+    def self.view_hash(result)
+      {
+        name: result[:title], href: "#{result[:url]}#{result[:fragment]}", url: result[:url],
+        count: result[:count], filename_count: result[:title_count],
+        context: result[:snippet_text].empty? ? [] : [result[:snippet_text]],
+        title_html: result[:title_html], snippet_html: result[:snippet_html],
+        folder: result[:folder].empty? ? nil : result[:folder]
+      }
+    end
+
+    private
+
+    def page(offset, limit)
+      @pages[[offset, limit]] ||=
+        if @index && !@query.empty?
+          @index.search(@query, offset: offset, limit: limit)
+        else
+          GnollHackSearch::Index::EMPTY
+        end
+    end
+  end
+
+  module GnollHackWikiSearch
+    def search(query)
+      parsed = GnollHackSearch::Query.parse(query)
+      [GnollHackSearchResults.new(GnollHackSearchIndexCache.current, parsed),
+       parsed.terms.map { |term| term.words.join(' ') }]
+    end
+  end
+
+  Gollum::Wiki.prepend(GnollHackWikiSearch)
+
+  module GnollHackSearchView
+    PER_PAGE = 20
+    MAX_PAGE = 50
+
+    def results
+      @gnollhack_results ||= @results.slice((page_number - 1) * PER_PAGE, PER_PAGE) || []
+    end
+
+    def total
+      @results.length
+    end
+
+    def has_query
+      !@query.to_s.strip.empty?
+    end
+
+    def has_results
+      !results.empty?
+    end
+
+    def no_results
+      has_query && total.zero?
+    end
+
+    def query_value
+      @query.to_s
+    end
+
+    def query_string
+      "&q=#{CGI.escape(@query.to_s)}&fulltext=1"
+    end
+
+    def next_page
+      page_number < MAX_PAGE && page_number * PER_PAGE < total ? (page_number + 1).to_s : nil
+    end
+
+    def previous_page
+      page_number > 1 ? (page_number - 1).to_s : nil
+    end
+
+    def next_page_path
+      next_page && page_path(next_page)
+    end
+
+    def previous_page_path
+      previous_page && page_path(previous_page)
+    end
+
+    def paged
+      total > PER_PAGE
+    end
+
+    def first_result
+      results.empty? ? 0 : (page_number - 1) * PER_PAGE + 1
+    end
+
+    def last_result
+      results.empty? ? 0 : (page_number - 1) * PER_PAGE + results.length
+    end
+
+    def result_summary
+      total == 1 ? '1 result' : "#{total} results"
+    end
+
+    def fulltext_path
+      "#{search_path}?q=#{CGI.escape(@query.to_s)}&fulltext=1"
+    end
+
+    def did_you_mean
+      return [] unless no_results && @results.respond_to?(:did_you_mean)
+      @gnollhack_did_you_mean ||= @results.did_you_mean
+    end
+
+    def has_did_you_mean
+      !did_you_mean.empty?
+    end
+
+    def noindex
+      true
+    end
+
+    def title
+      has_query ? "Search results for “#{@query}”" : 'Search'
+    end
+
+    def has_search_terms
+      false
+    end
+
+    private
+
+    def page_number
+      [[@page_num.to_i, 1].max, MAX_PAGE].min
+    end
+
+    def page_path(number)
+      "#{fulltext_path}&page_num=#{number}"
+    end
+  end
+
+  Precious::Views::Search.prepend(GnollHackSearchView)
+
+  class GnollHackSearchRoutes
+    PREFIX = '/gollum/search'
+    SUGGEST = '/gollum/search/suggest'
+    SLOTS = 2
+    # Seconds a search waits for a slot.
+    WAIT = 5
+    BUSY = "Search is busy. Try again in a few seconds.\n"
+
+    # A counting semaphore whose acquire gives up after a timeout.
+    class Gate
+      def initialize(slots)
+        @slots = slots
+        @busy = 0
+        @lock = Mutex.new
+        @released = ConditionVariable.new
+      end
+
+      def busy
+        @lock.synchronize { @busy }
+      end
+
+      def acquire(wait)
+        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + wait
+        @lock.synchronize do
+          while @busy >= @slots
+            remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+            return false if remaining <= 0
+            @released.wait(@lock, remaining)
+          end
+          @busy += 1
+        end
+        true
+      end
+
+      def release
+        @lock.synchronize do
+          @busy -= 1
+          @released.signal
+        end
+      end
+    end
+
+    GATE = Gate.new(SLOTS)
+
+    def initialize(app)
+      @app = app
+    end
+
+    def call(env)
+      return @app.call(env) unless env['PATH_INFO'].start_with?(PREFIX) && env['REQUEST_METHOD'] == 'GET'
+      unless GATE.acquire(WAIT)
+        return [503, { 'content-type' => 'text/plain; charset=utf-8', 'cache-control' => 'no-store', 'retry-after' => '5',
+                       'content-length' => BUSY.bytesize.to_s }, [BUSY]]
+      end
+      begin
+        case env['PATH_INFO']
+        when SUGGEST then suggest(params(env))
+        when PREFIX, "#{PREFIX}/" then go(params(env)) || @app.call(env)
+        else @app.call(env)
+        end
+      ensure
+        GATE.release
+      end
+    end
+
+    private
+
+    def params(env)
+      Rack::Request.new(env).GET
+    rescue StandardError
+      {}
+    end
+
+    def string(params, key)
+      value = params[key]
+      value.is_a?(String) ? value : ''
+    end
+
+    def go(params)
+      query = string(params, 'q')
+      return nil if query.strip.empty? || params.key?('fulltext') || string(params, 'page_num').to_i > 1
+      url = GnollHackSearchIndexCache.current&.go_target(query[0, GnollHackSearch::MAX_QUERY_LENGTH])
+      return nil unless url
+      link = CGI.escapeHTML(url)
+      body = %(<!DOCTYPE html>\n<title>Found</title>\n<p>Found at <a href="#{link}">#{link}</a>.</p>\n)
+      [302, { 'location' => url, 'content-type' => 'text/html; charset=utf-8', 'cache-control' => 'no-cache',
+              'content-length' => body.bytesize.to_s }, [body]]
+    end
+
+    def suggest(params)
+      query = string(params, 'q')[0, GnollHackSearch::MAX_QUERY_LENGTH]
+      index = query.strip.length >= 2 ? GnollHackSearchIndexCache.current : nil
+      pairs = index ? index.suggest(query) : []
+      site = GnollHackCrawlerSupport::SITE_URL
+      body = JSON.generate([query, pairs.map(&:first), [], pairs.map { |_, url| "#{site}#{url}" }])
+      [200, { 'content-type' => 'application/x-suggestions+json; charset=utf-8',
+              'cache-control' => 'public, max-age=300', 'content-length' => body.bytesize.to_s }, [body]]
+    end
+  end
+
+  Precious::App.use GnollHackSearchRoutes

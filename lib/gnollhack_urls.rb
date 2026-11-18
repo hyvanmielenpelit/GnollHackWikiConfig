@@ -36,9 +36,28 @@ module GnollHackUrls
   }.freeze
   URL_KEPT_PATTERN = Regexp.union(URL_KEPT.keys)
 
-  PASSTHROUGH_PATHS = %w[/robots.txt /sitemap.xml].freeze
+  PASSTHROUGH_PATHS = %w[/robots.txt /sitemap.xml /opensearch.xml].freeze
+
+  # Files GitHub gives a meaning to at a repository's root, compared without
+  # extension, ignoring case. README is matched in every folder.
+  GITHUB_FILES = %w[
+    LICENSE LICENCE COPYING NOTICE CONTRIBUTING CODE_OF_CONDUCT SECURITY SUPPORT GOVERNANCE FUNDING
+    CITATION CODEOWNERS CHANGELOG
+  ].freeze
 
   module_function
+
+  # True for a repository file that GitHub gives a meaning to rather than a
+  # wiki page: a README in any folder, a GITHUB_FILES name at the root, and
+  # anything under .github/.
+  def github_file?(path)
+    path = path.to_s
+    return true if path.start_with?('.github/')
+    segments = path.split('/')
+    name = segments.last.to_s.sub(EXTENSION, '').upcase
+    return true if name == 'README'
+    segments.length == 1 && GITHUB_FILES.include?(name)
+  end
 
   # The slug of a page path: '' for Home, nil when the path is not a valid
   # title (no segment, an empty segment, a segment that starts with '.', or a
@@ -72,7 +91,7 @@ module GnollHackUrls
   end
 
   # True for request paths that can never be a page: Gollum's own routes,
-  # dot-folders, robots.txt and the sitemap.
+  # dot-folders, robots.txt, the sitemap and the OpenSearch description.
   def passthrough?(path_info)
     path = path_info.to_s
     return true if PASSTHROUGH_PATHS.include?(path)

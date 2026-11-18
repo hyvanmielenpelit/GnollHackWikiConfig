@@ -1,6 +1,6 @@
 ---
 name: gollum_config_internals
-description: "Gollum and Sinatra behavior that config.rb and the libraries in lib/ depend on: how the config is loaded and merged, how page front matter is parsed, sanitized and shown, what Gollum serves from disk versus the committed ref, view and title quirks, the render lock, the sitemap, the asset cache policy, URL routing (slugs, the page index, rewrites and 301s, wikilinks, the commit check), and the rendered page cache (what is cached, the epoch, what ends an entry). Read before changing config.rb, adding a page metadata key, changing how wiki assets are cached, or changing anything a rendered page depends on."
+description: "Gollum and Sinatra behavior that config.rb and the libraries in lib/ depend on: how the config is loaded and merged, how page front matter is parsed, sanitized and shown, what Gollum serves from disk versus the committed ref, view and title quirks, the render lock, the sitemap, the asset cache policy, URL routing (slugs, the page index, rewrites and 301s, wikilinks, the commit check), the rendered page cache (what is cached, the epoch, what ends an entry), and the search (what replaces Gollum's search, the index and its background rebuild, the Go redirect, suggestions, the concurrency gate). Read before changing config.rb, adding a page metadata key, changing how wiki assets are cached, changing the search, or changing anything a rendered page depends on."
 ---
 
 # Gollum Internals Behind config.rb
@@ -101,7 +101,8 @@ block". `config.rb` wraps `Gollum::Filter::Render#extract` in a reentrant lock
 - Entries are the pages' canonical URLs, from the page index of the commit being listed
   (`GnollHackPageIndexCache.at`), which equal their `og:url`. Home is listed first, as
   `/`. A page outside the index would fall back to `page.escaped_url_path`.
-- `README.md` and pages in dot-folders are left out.
+- Pages in dot-folders and `GnollHackUrls.github_file?` pages (`README.md`, and root files such
+  as `LICENSE` or `CONTRIBUTING.md` with a page extension) are left out.
 - Dates come from one history walk. After a new commit, only the commits since the previous
   build are walked when the new commit descends from it (`repo.descendant_of?`); otherwise
   the full history is.
@@ -210,8 +211,8 @@ rendered page cache".
   and spaces and underscores folded (`fold`: spaces to `_`, runs squeezed, lowercased).
   Sinatra ignores one trailing slash.
 - **Middleware order**: `GnollHackFrontDoorOrigin` (ID check, host pinning; section 11) ->
-  `GnollHackCrawlerSupport` (HEAD to GET, robots, sitemap) -> `GnollHackAssetCaching` ->
-  `GnollHackCleanUrls` -> Gollum. Each `Precious::App.use` in `config.rb` adds the next
+  `GnollHackCrawlerSupport` (HEAD to GET, robots, sitemap, OpenSearch) -> `GnollHackAssetCaching`
+  -> `GnollHackCleanUrls` -> `GnollHackSearchRoutes` (section 10) -> Gollum. Each `Precious::App.use` in `config.rb` adds the next
   inner layer, so the order is the order of the sections. The rewrite replaces
   `PATH_INFO` with the escaped real path, which Gollum serves as before, `?raw` included.
 - **`escaped_url_path` is not overridden**: Gollum's tool pages build history, compare,
@@ -248,7 +249,8 @@ rendered page cache".
   guards the per-request figures.
 - **View load order**: the section reopens `Precious::Views::Page`, which is only safe
   after `require 'gollum/views/page'` (section 4); it also uses
-  `GnollHackAssetCaching::WIKI_ROOT`, so it is the last section of `config.rb`. Nothing in
+  `GnollHackAssetCaching::WIKI_ROOT`, so it comes after both; only the search section
+  (section 10), which builds on it, follows. Nothing in
   it reads the repository at load time, because `tools/fast_desc.rb` loads `config.rb`
   with no wiki.
 
@@ -294,6 +296,69 @@ rendered page cache".
   commit, must change the environment token (`environment_token` in `config.rb`), or it
   is served stale: a template helper that reads another file, a setting read from disk,
   the time of day. Add a `check_cache.rb` check for it.
+
+## 10. Search
+
+`lib/gnollhack_search.rb` (plain Ruby) and `config.rb`'s last section, "Search".
+
+- **Gollum's own search** (`get '/search'` in `gollum/lib/gollum/app.rb`, `Gollum::Wiki#search`
+  in `gollum-lib/lib/gollum-lib/wiki.rb`, the rugged adapter's `grep`) walks every blob of the
+  tree and matches binary files on their name, so it returns images, theme files and the
+  dot-folders. `config.rb` keeps the route and replaces what it computes:
+  `GnollHackWikiSearch#search` (prepended to `Gollum::Wiki`) returns
+  `[GnollHackSearchResults, terms]`, an object answering `empty?`, `length` and `slice`, and
+  `GnollHackSearchView` (prepended to `Precious::Views::Search`) asks it for one page of 20 in
+  rank order. Gollum's own `results` re-sorts by counts and calls `page_route`; the override
+  replaces it. `gollum/views/search` must be required before the prepend.
+- **Result hashes keep Gollum's keys** (`name`, `href`, `count`, `filename_count`, `context`),
+  so the stock `search.mustache` still renders; the wiki's template uses `title_html`,
+  `snippet_html`, `folder` (nil at the root: Ruby Mustache renders a section for `""`) and
+  `url`. `title_html` and `snippet_html` are the only triple-mustache values, built by escaping
+  each text segment and wrapping matches in `<mark>`, never by a regex over HTML.
+- **Templates**: `searchbar.mustache` is a partial; `Layout#partial` looks it up in
+  `--template-dir` first (`TemplateCascade#first_path_available`), so the wiki's copy replaces
+  it on every view, and `{{query_value}}` is a context miss (empty) outside the search view.
+  Both files are in the template folder, so they are part of the page cache's environment
+  token (section 9). Gollum's client script highlights `#search-results` with the layout's
+  `searchTerms`; the view sets `has_search_terms` false and the wiki's list has another id.
+- **What is indexed**: `GnollHackPageIndexCache`'s pages (section 8) less
+  `GnollHackUrls.github_file?` (a `README` in any folder; `LICENSE`, `CONTRIBUTING`, `SECURITY`
+  and the other `GITHUB_FILES` at the root, any extension, ignoring case; `.github/`). The
+  text is the committed Markdown source as plain text (`GnollHackSearch.page_text`); rendered
+  HTML is not used, because rendering every page takes minutes. The title is what Gollum shows
+  with `h1_title`: the opening H1 (Gollum's `div#gollum-root > h1:first-child`), else the
+  front matter `title`, else the file name.
+- **Normalization keeps length**: ASCII is lowercased with `tr`, every other character maps
+  to exactly one character (case fold, NFKD without combining marks, its first character;
+  typographic apostrophes and dashes to ASCII), so an offset in normalized text is an offset
+  in the original, which is how snippets, `<mark>` and text fragments are placed.
+- **The index cache** (`GnollHackSearchIndexCache.current`) calls
+  `GnollHackPageIndexCache.snapshot` (the commit check), then `state` (`[index, epoch, oid]`).
+  The first search after startup builds under the cache's mutex, so concurrent first searches
+  wait for one build; after a new commit the previous index is returned while a thread with
+  priority -1 builds the next. The build walks the commit's tree once, reads each page blob
+  with Rugged, closes the repository in `ensure` (section 8: mapped packs block `git pull` on
+  Windows), and calls `Thread.pass` after every page, also inside `Index.new`: with a yield
+  only every 25 pages, a page render during a build was four times slower under the GVL. A
+  failed build logs `GnollHack search: <class>: <message>` and keeps the previous index. The
+  mutex is never held with the page index lock or a render lock.
+- **`GnollHackSearchRoutes`** is the innermost middleware. Other paths cost one
+  `start_with?`. Under `/gollum/search` it takes a slot of `GATE` (2 slots; a request that
+  waits more than `WAIT` = 5 s answers 503 `no-store` with `retry-after: 5`), released in
+  `ensure` after Gollum's fully built body. A query equal to exactly one page's folded title
+  (`fold_title`: normalized, spaces and underscores as one space), without `fulltext` and not
+  past page 1, answers 302 `no-cache` with a path `Location`, which
+  `GnollHackFrontDoorOrigin` makes absolute for Front Door. `/gollum/search/suggest` answers
+  `[query, titles, [], absolute urls]` as `application/x-suggestions+json` with
+  `public, max-age=300` (kept by `GnollHackAssetCaching`, row 7).
+- **`/opensearch.xml`** is answered by `GnollHackCrawlerSupport` like `robots.txt`, and is a
+  router passthrough path. The layout links it with `rel="search"`.
+- **Never page-cached**: search URLs are under `/gollum/` and carry a query string.
+- **Measured costs** (development machine; it has phases in which every figure is about five
+  times higher): an index build 1.3 s for 2,472 pages, about 7 MB retained; a query under
+  10 ms in the index and about 30 ms for the whole request; a suggestion 0.15 ms; the
+  middleware's pass-through 0.0002 ms; a page render during a build 10 to 25% slower.
+  `tools/check_search.rb --timing` guards them.
 
 ## 11. Azure Front Door
 

@@ -260,6 +260,38 @@ class TestGnollHackUrls < Minitest::Test
     refute GnollHackUrls.passthrough?('/Items/Battle-axe')
   end
 
+  def test_crawler_files_pass_through
+    %w[/robots.txt /sitemap.xml /opensearch.xml].each { |path| assert GnollHackUrls.passthrough?(path), path }
+    assert_equal [:pass], route('/opensearch.xml')
+  end
+
+  # github_file?
+
+  def test_readme_is_a_github_file_in_any_folder
+    %w[README.md readme.md README README.rst Items/README.md Items/Readme.markdown].each do |path|
+      assert GnollHackUrls.github_file?(path), path
+    end
+  end
+
+  def test_root_github_files_ignore_case_and_extension
+    %w[LICENSE LICENSE.md license.txt LICENCE COPYING.md NOTICE CONTRIBUTING.md CODE_OF_CONDUCT.md
+       Security.md SUPPORT.md GOVERNANCE.md FUNDING.yml CITATION.cff CODEOWNERS CHANGELOG.md].each do |path|
+      assert GnollHackUrls.github_file?(path), path
+    end
+  end
+
+  def test_github_folder_is_a_github_file
+    assert GnollHackUrls.github_file?('.github/ISSUE_TEMPLATE/bug.md')
+    assert GnollHackUrls.github_file?('.github/CODEOWNERS')
+  end
+
+  def test_wiki_pages_are_not_github_files
+    ['Home.md', 'Supported Android Devices.md', 'Security Features.md', 'Items/LICENSE.md', 'Guides/Support.md',
+     'README notes.md', 'Changelog of GnollHack.md', 'Licenses.md', '.githubx/a.md'].each do |path|
+      refute GnollHackUrls.github_file?(path), path
+    end
+  end
+
   # partition_paths
 
   def test_partition_paths
